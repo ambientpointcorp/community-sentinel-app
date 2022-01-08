@@ -1,0 +1,373 @@
+---
+title: "Community Sentinel: a mobility tracing app to beat COVID-19"
+resource_files:
+  - data/cs_historical_data.rds
+  - data/cs_behavioral_data.rds
+output: 
+  flexdashboard::flex_dashboard:
+    vertical_layout: fill
+    theme: readable
+  runtime: shiny_prerendered
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(sf)
+library(shiny)
+library(leaflet)
+library(echarts4r)
+
+# Load app rds file
+behavioral_data <- read_rds("data/cs_behavioral_data.rds")
+
+# Load dashboard rds file
+historical_data <- read_rds("data/cs_historical_data.rds")
+
+# Epidemic trends citywide
+citywide_trends <- historical_data %>%
+  st_drop_geometry %>%
+  ungroup %>%
+  group_by(date_range_end) %>%
+  summarise(cases_per_10k_citywide = round(10000 * sum(home_positive_tests_change, na.rm = TRUE) / sum(home_tract_pop_est, na.rm = TRUE), 2))
+
+# Census tract map data
+phl_map <- historical_data %>% 
+  filter(!st_is_empty(home_tract_geometry)) %>%
+  filter(date_range_end == last(date_range_end)) %>%
+  st_sf(sf_column_name = "home_tract_geometry")
+
+# POI metrics
+poi_metrics <- behavioral_data %>%
+  group_by(home_tract, visited_tract, 
+           visited_poi_subcategory, visited_location_name, visited_street_address) %>%
+  summarise(n_visitors = sum(n_visitors_est, na.rm = TRUE),
+            n_infected = sum(new_infected_adj, na.rm = TRUE),
+            n_tract_pop = max(home_tract_pop_est)) %>%
+  arrange(desc(n_infected))
+
+# Visited POI metrics
+visited_poi_metrics <- poi_metrics %>%
+  ungroup %>%
+  group_by(visited_tract, visited_poi_subcategory) %>%
+  summarise(sum_infected = sum(n_infected, na.rm = TRUE),
+            sum_visitors = sum(n_visitors, na.rm = TRUE),
+            infected_per_10k_visitors = ifelse(sum(n_visitors, na.rm = TRUE) > 0, round(10000 * sum(n_infected, na.rm = TRUE) / sum(n_visitors, na.rm = TRUE), 2), 0)) %>%
+  ungroup %>%
+  group_by(visited_tract) %>%
+  mutate(risk_per_10k_visitors_in_tract = round(10000 * sum(sum_infected, na.rm = TRUE) / sum(sum_visitors, na.rm = TRUE), 2),
+         delta_within_tract = round(10000 * sum_infected / sum(sum_visitors, na.rm = TRUE), 2)) %>%
+  arrange(visited_tract, desc(delta_within_tract))
+
+# Census tract risk map data
+phl_risk_map <- visited_poi_metrics %>% 
+  group_by(visited_tract) %>% 
+  summarise(infected_per_10k_visitors = ifelse(sum(sum_visitors, na.rm = TRUE) > 0, round(10000 * sum(sum_infected, na.rm = TRUE) / sum(sum_visitors, na.rm = TRUE), 2), 0)) %>%
+  left_join(behavioral_data %>% 
+              distinct(visited_tract, visited_tract_geometry), by = "visited_tract") %>%
+  st_sf(sf_column_name = "visited_tract_geometry")
+
+# Epidemic summary citywide vs. at selected tract
+epi_summary_by_tract <- function(tract) {
+  historical_data %>%
+    st_drop_geometry %>%
+    ungroup %>%
+    filter(home_tract %in% tract) %>%
+    select(home_tract, home_tract_pop_est, date_range_end, 
+           home_positive_tests_change, home_test_positivity_pct) %>%
+    mutate(cases_per_10k_tract = round(10000 * home_positive_tests_change / home_tract_pop_est, 2)) %>%
+    inner_join(citywide_trends, by = "date_range_end") %>%
+    e_charts(date_range_end) %>% 
+    e_area(cases_per_10k_citywide) %>% 
+    e_line(cases_per_10k_tract) %>% 
+    e_axis_labels(y = "Weekly cases") %>%
+    e_legend(right = "25%", top = "25%", orient = "vertical") %>%
+    e_tooltip(trigger = "axis", axisPointer = list(type = "cross"))
+}
+
+# Word cloud at selected tract
+word_cloud_by_home_tract <- function(tract) {
+  poi_metrics %>%
+    ungroup %>%
+    filter(home_tract %in% tract) %>%
+    group_by(visited_poi_subcategory) %>%
+    summarise(n_infected = sum(n_infected, na.rm = TRUE),
+              n_visitors = sum(n_visitors, na.rm = TRUE),
+              n_tract_pop = max(n_tract_pop, na.rm = TRUE)) %>%
+    mutate(infection_rate = n_infected / n_visitors,
+           visitation_rate = n_visitors / n_tract_pop) %>%
+    mutate(risk_per_10k = round(10000 * infection_rate, 2),
+           visits_per_10k = round(10000 * visitation_rate, 0)) %>%
+    arrange(visits_per_10k) %>%
+    e_color_range(visits_per_10k, color, colors) %>%
+    e_charts() %>%
+    e_cloud(visited_poi_subcategory, visits_per_10k, color) %>%
+    e_tooltip(trigger = "item")
+}
+
+# Behavioral risk comparison
+epi_summary_by_similarity <- function(location_name, tract) {
+  behavioral_data %>%
+    mutate(similarity = ifelse((str_c(visited_location_name, " at ", visited_street_address) %in% location_name)
+                               & (home_tract %in% tract), "Like me from my tract", 
+                               ifelse((home_tract %in% tract), "Others from my tract", 
+                                      ifelse((str_c(visited_location_name, " at ", visited_street_address) %in% location_name), "Like me from other tracts",
+                                             "Others from other tracts")))) %>%
+    group_by(similarity) %>%
+    summarise(n_visitors = sum(n_visitors_est, na.rm = TRUE),
+              n_infected = sum(new_infected_adj, na.rm = TRUE),
+              additive_infection_rate = `%*%`(ifelse(n_visitors_est > 0,
+                                                ifelse(is.na(new_infected_adj), 0,
+                                                       new_infected_adj), 0),
+                                         1 / ifelse(n_visitors_est > 0,
+                                                    n_visitors_est, 1))) %>%
+    mutate(infection_rate = ifelse(similarity %in% c("Like me from my tract"), 
+                                   additive_infection_rate,
+                                   n_infected / n_visitors)) %>%
+    mutate(risk_per_10k = round(10000 * infection_rate, 2)) %>%
+    e_charts(similarity) %>%
+    e_bar(risk_per_10k, showBackground = TRUE) %>%
+    e_axis_labels(y = "Risk per 10K visitors") %>%
+    e_legend(show = FALSE) %>%
+    e_theme("infographic") %>%
+    e_tooltip(trigger = "item", axisPointer = list(type = "cross"))
+}
+
+# Epidemic impact of POI subcategories within tract
+epi_impact_within_tract <- function(tract) {
+  visited_poi_metrics  %>%
+    filter(visited_tract == tract) %>%
+    filter(!is.na(visited_poi_subcategory)) %>%
+    arrange(desc(delta_within_tract)) %>%
+    top_n(n = 10) %>%
+    arrange(delta_within_tract) %>% 
+    e_charts(visited_poi_subcategory, grid = list(containLabel = TRUE)) %>%
+    e_scatter(risk_per_10k_visitors_in_tract) %>%
+    e_mark_line(data = list(type = "average", 
+                            name = "AVG", 
+                            label = list(formatter = "Risk per 10K visitors to tract")),
+                symbol = "none") %>%
+    e_bar(delta_within_tract, showBackground = TRUE) %>%
+    e_x_axis(axisLabel = list(fontSize = 9)) %>%
+    e_flip_coords() %>%
+    e_axis_labels(y = "Contributed risk per 10K visitors to tract") %>%
+    e_legend(show = FALSE) %>%
+    e_theme("infographic") %>%
+    e_tooltip(trigger = "axis")
+}
+```
+
+
+Trends and Behaviors
+=====================================
+Column {data-width=500}
+-------------------------------------
+### **Select a Census Tract to view trends and behaviors**
+```{r}
+# Draw the map without selected tracts
+output$map <- renderLeaflet({
+    pal <- colorNumeric('Reds', NULL)
+    map <- leaflet(phl_map) %>%
+      addProviderTiles('CartoDB.Positron') %>%
+      clearShapes() %>%
+      addPolygons(stroke = FALSE, smoothFactor = 0, 
+                  fillColor = ~pal(home_pos_prevalence_pct), fillOpacity = 0.25, 
+                  layerId = ~home_tract) %>%
+      addLegend(position = 'bottomright', pal = pal, 
+                values = phl_map$home_pos_prevalence_pct,
+                labFormat = labelFormat(transform = function(x) 100 * x,
+                                        suffix = "%"),
+                title = "Positive test rate")
+    map
+  })
+
+# Click event for the map (will use to generate chart)
+clicked_tract <- eventReactive(input$map_shape_click, {
+    x <- input$map_shape_click
+    y <- x$id
+    return(y)
+  })
+
+observe({
+  req(clicked_tract()) # do this if clicked_tract() is not null
+  # Add the clicked tract to the map, and remove when a new one is clicked
+  map <- leafletProxy('map') %>%
+      removeShape('htract') %>%
+      addPolygons(data = phl_map[phl_map$home_tract == clicked_tract(), ], fill = FALSE,
+                  color = 'grey', opacity = 0.5, layerId = 'htract')
+  })
+
+leafletOutput('map', height = 1000)  
+```
+
+Column {data-width=500}
+-------------------------------------
+### **Selected Census Tract's weekly epidemic trend vs. citywide per 10K residents**
+```{r}
+observe({
+  req(clicked_tract()) # do this if clicked_tract() is not null
+  output$epi_summary_by_tract <- renderEcharts4r({
+    epi_summary_by_tract(clicked_tract())
+  })
+})
+echarts4rOutput("epi_summary_by_tract")
+```
+
+### **Locations visited by Census Tract's residents, sized by visitors per 10K residents**
+```{r}
+observe({
+  req(clicked_tract()) # do this if clicked_tract() is not null
+  output$word_cloud_by_home_tract <- renderEcharts4r({
+    word_cloud_by_home_tract(clicked_tract())
+  })
+})
+echarts4rOutput("word_cloud_by_home_tract")
+```
+
+
+Personal Risk {data-orientation=rows}
+=====================================
+
+Inputs {.sidebar}
+-------------------------------------
+###### **Visited locations**
+```{r}
+# Visited locations from selected tract
+visited_poi_from_tract <- poi_metrics %>%
+  ungroup %>%
+  distinct(visited_poi_from_tract = str_c(visited_location_name, 
+                                          " at ", visited_street_address)) %>%
+  pull
+
+# Menu of locations
+selectInput("locations", "Select visited locations in the last 2 weeks:",
+            multiple = TRUE,
+            choices = visited_poi_from_tract)
+
+# Selected locations (will use to generate chart)
+selected_locations <- eventReactive(input$locations, {
+    x <- input$locations
+    return(x)
+})
+```
+
+Row {data-height=750}
+-------------------------------------
+### **Risk for Census Tract's residents visiting selected locations vs. others (last 2 weeks)**
+```{r}
+observe({
+  req(clicked_tract(), selected_locations()) # do this if clicked_tract(), selected_locations() are not null
+  output$epi_summary_by_similarity <- renderEcharts4r({
+    epi_summary_by_similarity(selected_locations(), clicked_tract())
+  })
+})
+echarts4rOutput("epi_summary_by_similarity")
+```
+
+Row {data-height=250}
+-------------------------------------
+### **Recommendations**
+* Avoid crowded places and events
+* Wear a mask
+* Practice social distancing
+* Wash hands frequently
+
+
+Business Risk
+=====================================
+Column {data-width=500}
+-------------------------------------
+### **Select a Census Tract to view visited location type risk**
+```{r}
+# Draw the map without selected tracts
+output$risk_map <- renderLeaflet({
+    pal <- colorNumeric('Reds', NULL)
+    risk_map <- leaflet(phl_risk_map) %>%
+  addProviderTiles('CartoDB.Positron') %>%
+  clearShapes() %>%
+  addPolygons(stroke = FALSE, smoothFactor = 0, 
+              fillColor = ~pal(infected_per_10k_visitors), fillOpacity = 0.25, 
+              layerId = ~visited_tract) %>%
+  addLegend(position = 'bottomright', pal = pal, 
+            values = phl_risk_map$infected_per_10k_visitors,
+            labFormat = labelFormat(transform = function(x) 1 * x,
+                                    suffix = ""),
+            title = "Risk per 10k visitors")
+    risk_map
+  })
+
+# Click event for the map (will use to generate chart)
+clicked_risk_tract <- eventReactive(input$risk_map_shape_click, {
+    x <- input$risk_map_shape_click
+    y <- x$id
+    return(y)
+  })
+
+observe({
+  req(clicked_risk_tract()) # do this if clicked_risk_tract() is not null
+  # Add the clicked tract to the map, and remove when a new one is clicked
+  risk_map <- leafletProxy('risk_map') %>%
+      removeShape('vtract') %>%
+      addPolygons(data = phl_risk_map[phl_risk_map$visited_tract == clicked_risk_tract(), ], fill = FALSE,
+                  color = 'grey', opacity = 0.5, layerId = 'vtract')
+  })
+
+leafletOutput('risk_map', height = 1000)  
+```
+
+Column {data-width=500}
+-------------------------------------
+### **Top risk contributors within the Census Tract**
+```{r}
+observe({
+  req(clicked_risk_tract()) # do this if epi_impact_within_tract() is not null
+  output$epi_impact_within_tract <- renderEcharts4r({
+    epi_impact_within_tract(clicked_risk_tract())
+  })
+})
+echarts4rOutput("epi_impact_within_tract")
+```
+
+
+Notes
+=====================================
+Column {data-width=600}
+-------------------------------------
+### **Notes**
+
+*About this app*
+
+Community Sentinel is an rmarkdown/shiny demo app based on the flexdashboard package, associating mobility patterns and point-of-interest visits with covid-19 community infection within Philadelphia, estimating a risk profile for specific behaviors within neighborhoods.
+ 
+*About our approach*
+
+We model the dynamics of the COVID-19 epidemic as a network of neighborhoods connected by people moving about Philadelphia visiting places and points of interest, transmitting or acquiring the disease at a rate functionally related to the prevalence of the disease within their dwelling geographies and visited places. Following the approaches presented in [3, 4, 5, 6], we look at mobility patterns from anonymized and aggregated location data to analyze the progression of the epidemic within a dynamic network of locally connected sub-populations.
+
+Using Philadelphia’s COVID-19 cases data, as published in OpenDataPhilly by the Philadelphia Department of Public Health, we track the daily course of the epidemic across neighborhoods, summarized by zip code.
+
+Using SafeGraph's mobility data, as made available by the COVID-19 Data Consortium, we estimate the number of people who have visited any point of interest (POI), and which geography people visit from, on a weekly basis. Infection resulting from mobility is modeled to happen within one period and with two transmission paths, assuming random mixing: 1) from the encounter of visitors at specific places; and 2) from visitors' general mobility within and outside their local geographies, accounting for other non-POI mobility-related factors.
+
+We aggregate mobility patterns by census tract, and distribute confirmed infections proportionally from zip code to census tract using zip-code-tract crosswalks, in order to use a common geographic unit between mobility and epidemic data.
+
+*Credits*
+
+COVID-19 data is provided by the Philadelphia Department of Public Health, published daily through the OpenDataPhilly platform, and cumulatively archived by Ambient Point. To access this data, visit the OpenDataPhilly COVID-19 catalog: https://www.opendataphilly.org/dataset?q=covid
+
+Mobility data is provided by SafeGraph (https://www.safegraph.com/), a data company that aggregates anonymized location data from numerous applications in order to provide insights about physical places, via the Placekey Community (https://www.placekey.io/). To enhance privacy, SafeGraph excludes census block group information if fewer than five devices visited an establishment in a month from a given census block group. For more information, visit SafeGraph's documentation: https://docs.safegraph.com/docs
+
+*References*
+
+1. Master Question List for COVID-19 (caused by SARS-CoV-2); Science and Technology Weekly Report, Department of Homeland Security: https://www.dhs.gov/publication/st-master-question-list-covid-19
+2. Determining Point-of-Interest Visits From Location Data: A Technical Guide To Visit Attribution; SafeGraph, Inc.: https://www.safegraph.com/visit-attribution
+3. Bjørnstad, O.N, Shea, K., Krzywinski, M., Altman, N.; Modeling infectious epidemics; Nature Methods 17, 455-456 (2020)
+4. Bjørnstad, O.N, Shea, K., Krzywinski, M., Altman, N.; The SEIRS model for infectious disease dynamics; Nature Methods 17, 555-558 (2020)
+5. Long, E.F., Nohdurft, E., Spinler, S.; Spatial Resource Allocation for Emerging Epidemics: A Comparison of Greedy, Myopic, and Dynamic Policies; Manufacturing & Service Operations Management 20(2):181-198 (2018)
+6. Chang, S., Pierson, E., Koh, P.W., Gerardin, J., Redbird, B., Grusky, D., Leskovec, L.; Mobility network models of COVID-19 explain inequities and inform reopening; Nature (2020)
+
+Column {data-width=400}
+-------------------------------------
+### **Disclaimer**
+
+Warranty: References in this wep app to any specific commercial products, process, or service by trade name, trademark, manufacturer, or otherwise do not necessarily constitute or imply the endorsement, recommendation, favoring, opposition, discouragement or dissuasion by Ambient Point Corp. This web app and the information, software, and other material available on or accessible from this site are provided on an “AS IS” and “AS AVAILABLE” basis without warranties of any kind, either express or implied, including but not limited to warranties of title, non-infringement or implied warranties of merchantability or fitness for a particular purpose. Ambient Point Corp. does not warrant that the web app will be uninterrupted or error free or that any information, software or other material available on or accessible through the site is free of material errors or inaccuracies.
+
+Liability: By accessing the information provided on this web app, each user waives and releases Ambient Point Corp. to the full extent permitted by law from any and all claims related to the use of the subject information. Under no circumstances shall Ambient Point Corp. be liable for any direct, indirect, incidental, special, punitive or consequential damages that result in any way from your use of or inability to use the web app or your reliance on or use of information, services, or merchandise provided on or through the site, or that result from mistakes, omissions, interruptions, deletion of files, errors, inaccuracies, defects, delays in operation or transmission, or any failure of performance.
